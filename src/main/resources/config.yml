@@ -1,0 +1,65 @@
+database:
+  type: sqlite
+  sqlite:
+    file: swagapi.db
+  mysql:
+    host: localhost
+    port: 3306
+    database: swagapi
+    username: root
+    password: ""
+    pool-size: 10
+    connection-timeout: 30000
+    idle-timeout: 600000
+    max-lifetime: 1800000
+    use-ssl: false
+
+economy:
+  enabled: true
+
+messaging:
+  prefix: "&8[&bSwagAPI&8] &r"
+  date-format: "MM/dd/yyyy HH:mm"
+
+player-data:
+  cache-expiry-minutes: 10
+  auto-save-interval-minutes: 5
+
+event-bus:
+  log-events: false
+
+debug: false
+
+updates:
+  enabled: true
+  # URL of the JSON manifest listing plugin versions, download URLs, and checksums.
+  # Expected format: { "PluginName": { "version": "1.2.3", "url": "https://...", "checksum": "<sha256>" }, ... }
+  manifest-url: "https://raw.githubusercontent.com/swag617/swag-versions/main/versions.json"
+  # How often to poll the manifest for new versions (in hours).
+  check-interval-hours: 6
+  # Notify online admins (swagapi.admin permission) about available updates on join.
+  notify-on-join: true
+  # Run an update check automatically 2 seconds after server startup.
+  auto-check-on-startup: true
+  # Chat prefix used in update notification messages.
+  prefix: "&8[&bSwagAPI&8] &r"
+
+web-server:
+  # Set to false to disable the shared HTTP web server entirely.
+  enabled: true
+  # TCP port the server listens on. Change if 8080 conflicts with another service.
+  port: 8080
+  # Bind address. Use 0.0.0.0 to listen on all interfaces, or a specific IP to restrict access.
+  bind-address: "0.0.0.0"
+  # Number of threads in the HTTP handler pool. Increase under heavy API load.
+  threads: 8
+  auth:
+    # Set to false to disable login (not recommended on publicly exposed ports).
+    enabled: true
+    # How many days a login session lasts. Each page visit slides the window forward.
+    session-days: 30
+    # How many minutes an in-game account-setup link stays valid before expiring.
+    setup-token-minutes: 15
+    # When true, OPs (swagapi.web permission) with no linked web panel account get a
+    # clickable in-game chat prompt on join to create one via the browser.
+    remind-ops-on-join: true

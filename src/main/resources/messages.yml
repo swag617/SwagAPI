@@ -1,0 +1,7 @@
+prefix: "&8[&bSwagAPI&8] &r"
+
+no-permission: "&cYou do not have permission to do that."
+player-only: "&cThis command can only be run by a player."
+reload-success: "&aSwagAPI configuration reloaded successfully."
+plugin-info: "&bSwagAPI &7v{version} &8| &7Author: &bSwag617"
+unknown-command: "&cUnknown subcommand. Usage: &7{usage}"

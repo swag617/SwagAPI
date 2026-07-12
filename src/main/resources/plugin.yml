@@ -1,0 +1,25 @@
+name: SwagAPI
+version: 1.0.0
+api-version: "1.21"
+main: com.SwagDev.SwagAPI.SwagAPI
+author: Swag617
+description: Shared API and communication backbone for all Swag plugins.
+prefix: SwagAPI
+
+commands:
+  swagapi:
+    description: SwagAPI admin command
+    usage: /swagapi <reload|status|info|updatecheck|update|updates|web>
+    permission: swagapi.admin
+    aliases: [sapi]
+
+permissions:
+  swagapi.admin:
+    description: Access SwagAPI admin commands
+    default: op
+  swagapi.updates:
+    description: Stage plugin updates via SwagAPI
+    default: op
+  swagapi.web:
+    description: View web server status and registered modules via SwagAPI
+    default: op
