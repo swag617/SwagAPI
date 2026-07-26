@@ -72,14 +72,37 @@ public class DatabaseService implements IDatabaseService {
         return "sqlite".equals(dbType);
     }
 
+    /**
+     * Runs {@code task} on an async scheduler thread. If SwagAPI is disabling (or already
+     * disabled) when this is called, the scheduler rejects new task registrations, so we
+     * fall back to running the task synchronously on the calling thread instead. This matters
+     * because {@link PlayerDataService#saveAll()} (the shutdown flush) calls dependent
+     * plugins' {@code PlayerDataModule#save(...)} implementations directly, and those
+     * implementations commonly go through this method to persist their data — without this
+     * fallback, any such module would fail its final save with
+     * "Plugin attempted to register task while disabled" during every server shutdown.
+     */
     @Override
     public void executeAsync(Runnable task) {
+        if (!plugin.isEnabled()) {
+            task.run();
+            return;
+        }
         plugin.getServer().getScheduler().runTaskAsynchronously(plugin, task);
     }
 
+    /** See {@link #executeAsync(Runnable)} for why the disabled-plugin fallback exists. */
     @Override
     public <T> CompletableFuture<T> queryAsync(Callable<T> query) {
         CompletableFuture<T> future = new CompletableFuture<>();
+        if (!plugin.isEnabled()) {
+            try {
+                future.complete(query.call());
+            } catch (Exception e) {
+                future.completeExceptionally(e);
+            }
+            return future;
+        }
         plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
             try {
                 future.complete(query.call());

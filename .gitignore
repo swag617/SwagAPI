@@ -45,6 +45,9 @@ Thumbs.db
 # Internal planning docs — not for the public repo
 Gameplan/
 GAMEPLAN.md
+DECISIONS.md
+HANDOFF_REPORT.md
+TEST_CHECKLIST.md
 
 # Compiled classes and jars (built jars belong in GitHub Releases, not Git)
 *.class

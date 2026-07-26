@@ -6,6 +6,7 @@ import com.SwagDev.SwagAPI.events.SwagPlayerDataLoadEvent;
 import com.SwagDev.SwagAPI.events.SwagPlayerDataSaveEvent;
 import com.SwagDev.SwagAPI.model.PlayerDataModule;
 import com.SwagDev.SwagAPI.model.SwagPlayerProfile;
+import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 import org.bukkit.scheduler.BukkitTask;
 
@@ -113,9 +114,12 @@ public class PlayerDataService implements IPlayerDataService {
         return future;
     }
 
-    private void saveProfileInternal(UUID uuid) {
+    /**
+     * @return true if the profile (and all module data) saved without error, false otherwise.
+     */
+    private boolean saveProfileInternal(UUID uuid) {
         SwagPlayerProfile profile = profileCache.get(uuid);
-        if (profile == null) return;
+        if (profile == null) return false;
         try {
             upsertPlayer(profile);
             for (Map.Entry<String, PlayerDataModule> entry : modules.entrySet()) {
@@ -124,11 +128,36 @@ public class PlayerDataService implements IPlayerDataService {
                     entry.getValue().save(uuid, data, db).join();
                 }
             }
-            plugin.getServer().getScheduler().runTask(plugin, () ->
-                    plugin.getServer().getPluginManager().callEvent(
-                            new SwagPlayerDataSaveEvent(uuid, profile)));
+            fireSaveEvent(uuid, profile);
+            return true;
         } catch (Exception e) {
             plugin.getLogger().warning("Error during profile save for " + uuid + ": " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Fires {@link SwagPlayerDataSaveEvent} for a completed save.
+     * <p>
+     * The periodic auto-save timer and {@link #saveProfile(UUID)} call this from an async
+     * scheduler thread, so the event is normally dispatched via {@code runTask} to hop back
+     * onto the main thread (Bukkit events must fire synchronously on the primary thread).
+     * <p>
+     * {@link #saveAll()} (the shutdown flush) calls this directly from the main thread while
+     * {@code onDisable()} is executing. At that point {@code plugin.isEnabled()} is already
+     * false — Bukkit flips it before invoking {@code onDisable()} — so scheduling a new task
+     * via {@code runTask} would throw {@code IllegalPluginAccessException: "Plugin attempted
+     * to register task while disabled"}. We detect that case (or simply being on the primary
+     * thread already, which is always true during shutdown) and call the event directly
+     * instead, since no thread-hop is needed or even possible at that point.
+     */
+    private void fireSaveEvent(UUID uuid, SwagPlayerProfile profile) {
+        SwagPlayerDataSaveEvent event = new SwagPlayerDataSaveEvent(uuid, profile);
+        if (!plugin.isEnabled() || Bukkit.isPrimaryThread()) {
+            plugin.getServer().getPluginManager().callEvent(event);
+        } else {
+            plugin.getServer().getScheduler().runTask(plugin, () ->
+                    plugin.getServer().getPluginManager().callEvent(event));
         }
     }
 
@@ -149,15 +178,33 @@ public class PlayerDataService implements IPlayerDataService {
         }
     }
 
+    /**
+     * Flushes every cached profile synchronously on the calling thread. Intended to be
+     * called from {@code SwagAPI#onDisable()} — at that point the Bukkit scheduler will
+     * reject new task registrations (see {@link #fireSaveEvent}), so every DB write here
+     * happens directly (blocking is expected and correct: the server is stopping) and no
+     * work is handed off to the scheduler. Logs a single summary line rather than one line
+     * per profile; individual failures still get their own warning from
+     * {@link #saveProfileInternal} so they remain diagnosable.
+     */
     @Override
     public void saveAll() {
         if (autoSaveTask != null) {
             autoSaveTask.cancel();
+            autoSaveTask = null;
         }
+        int saved = 0;
+        int failed = 0;
         for (UUID uuid : profileCache.keySet()) {
-            saveProfileInternal(uuid);
+            if (saveProfileInternal(uuid)) {
+                saved++;
+            } else {
+                failed++;
+            }
         }
         profileCache.clear();
+        plugin.getLogger().info("[SwagAPI] Saved " + saved + " player profile(s) on shutdown"
+                + (failed > 0 ? " (" + failed + " failed — see warnings above)." : "."));
     }
 
     @Override
