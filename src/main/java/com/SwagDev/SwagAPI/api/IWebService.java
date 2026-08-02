@@ -48,7 +48,33 @@ public interface IWebService {
     void registerModule(Plugin plugin, HttpHandler handler);
 
     /**
-     * Removes the HTTP handler registered by the given plugin.
+     * Registers an HTTP handler for server-to-server calls between Swag-ecosystem plugins
+     * across a network (e.g. a hub server reading another server's player stats).
+     *
+     * <p>Mounted at {@code /swagnet/<plugin-name>/}, prefix-stripped the same way as
+     * {@link #registerModule}. <b>Not</b> gated by SwagAPI's human login/session system —
+     * a browser session cookie is meaningless to a server-to-server caller. Instead, every
+     * request must carry a {@code X-SwagNetwork-Key} header matching this server's
+     * {@code network.shared-secret} config value exactly (constant-time compared). If that
+     * config value is blank (the default), every {@code /swagnet/} route rejects all
+     * requests with 503 — this fails closed, not open, so forgetting to configure the
+     * secret can never accidentally leave these routes unauthenticated.</p>
+     *
+     * <p>Callers (e.g. a hub server) send the same header on their outgoing request; the
+     * secret must be configured identically on every server that should trust each other.</p>
+     *
+     * @param plugin  the plugin registering the module; its name (lower-cased) becomes
+     *                the path segment
+     * @param handler the {@link HttpHandler} that will receive stripped, key-verified requests
+     */
+    void registerServiceModule(Plugin plugin, HttpHandler handler);
+
+    /**
+     * Removes the HTTP handler registered by the given plugin via {@link #registerModule}.
+     * Does not affect a {@link #registerServiceModule} registration for the same plugin —
+     * see {@link #unregisterServiceModule} for that. A plugin using both registers two
+     * independent lifecycles, since e.g. SwagCore's dashboard and its network-service API
+     * are typically owned by different modules that enable/disable independently.
      *
      * <p>Silently does nothing if the plugin has no registered module or if the
      * web server is not running.</p>
@@ -56,6 +82,17 @@ public interface IWebService {
      * @param plugin the plugin whose module should be removed
      */
     void unregisterModule(Plugin plugin);
+
+    /**
+     * Removes the HTTP handler registered by the given plugin via {@link #registerServiceModule}.
+     * Does not affect a {@link #registerModule} registration for the same plugin.
+     *
+     * <p>Silently does nothing if the plugin has no registered service module or if the
+     * web server is not running.</p>
+     *
+     * @param plugin the plugin whose network-service module should be removed
+     */
+    void unregisterServiceModule(Plugin plugin);
 
     /**
      * Returns whether the web server is currently accepting connections.

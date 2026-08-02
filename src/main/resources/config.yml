@@ -44,6 +44,14 @@ updates:
   # Chat prefix used in update notification messages.
   prefix: "&8[&bSwagAPI&8] &r"
 
+network:
+  # Shared secret for server-to-server API calls between Swag plugins across your network
+  # (e.g. a hub server reading another server's player stats via /swagnet/<plugin>/...).
+  # Must be identical on every server that should trust each other. Leave blank (the
+  # default) to disable ALL /swagnet/ routes — they fail closed, not open, so an unset
+  # secret never accidentally leaves them unauthenticated.
+  shared-secret: ""
+
 web-server:
   # Set to false to disable the shared HTTP web server entirely.
   enabled: true

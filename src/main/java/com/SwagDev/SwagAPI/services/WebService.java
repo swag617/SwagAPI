@@ -67,6 +67,10 @@ public class WebService implements IWebService {
     private long sessionDurationMs;
     private long setupTokenDurationMs;
 
+    // ── Server-to-server ("/swagnet/") auth — separate from the human session system above ──
+    private String networkSharedSecret;
+    private static final String NETWORK_KEY_HEADER = "X-SwagNetwork-Key";
+
     /** token → session. Access is thread-safe; ConcurrentHashMap handles concurrent requests. */
     private final ConcurrentHashMap<String, Session> sessions = new ConcurrentHashMap<>();
     private final SecureRandom secureRandom = new SecureRandom();
@@ -114,6 +118,8 @@ public class WebService implements IWebService {
         sessionDurationMs = sessionDays * 24L * 60L * 60L * 1000L;
         int setupMinutes = plugin.getConfig().getInt("web-server.auth.setup-token-minutes", 15);
         setupTokenDurationMs = setupMinutes * 60L * 1000L;
+
+        networkSharedSecret = plugin.getConfig().getString("network.shared-secret", "");
 
         loadAccounts();
 
@@ -323,6 +329,31 @@ public class WebService implements IWebService {
     }
 
     @Override
+    public void registerServiceModule(Plugin plugin, HttpHandler handler) {
+        if (!running || server == null) return;
+
+        String name    = plugin.getName().toLowerCase();
+        String path    = "/swagnet/" + name + "/";
+        String noSlash = "/swagnet/" + name;
+
+        try { server.removeContext(path);    } catch (IllegalArgumentException ignored) {}
+        try { server.removeContext(noSlash); } catch (IllegalArgumentException ignored) {}
+
+        server.createContext(path, exchange -> {
+            if (!verifyServiceKey(exchange)) return;
+            new PrefixStrippingHandler(path, handler).handle(exchange);
+        });
+
+        server.createContext(noSlash, exchange -> {
+            exchange.getResponseHeaders().set("Location", path);
+            exchange.sendResponseHeaders(301, -1);
+            exchange.close();
+        });
+
+        this.plugin.getLogger().info("[SwagAPI] Registered network-service module: " + name + " -> " + path);
+    }
+
+    @Override
     public void unregisterModule(Plugin plugin) {
         if (!running || server == null) return;
 
@@ -335,6 +366,47 @@ public class WebService implements IWebService {
 
         registeredModules.remove(name);
         this.plugin.getLogger().info("[SwagAPI] Unregistered web module: " + name);
+    }
+
+    @Override
+    public void unregisterServiceModule(Plugin plugin) {
+        if (!running || server == null) return;
+
+        String name    = plugin.getName().toLowerCase();
+        String path    = "/swagnet/" + name + "/";
+        String noSlash = "/swagnet/" + name;
+
+        try { server.removeContext(path);    } catch (IllegalArgumentException ignored) {}
+        try { server.removeContext(noSlash); } catch (IllegalArgumentException ignored) {}
+
+        this.plugin.getLogger().info("[SwagAPI] Unregistered network-service module: " + name);
+    }
+
+    /**
+     * Gate for every {@code /swagnet/} route — a shared-secret header check, not a session
+     * cookie. Fails closed: if {@code network.shared-secret} isn't configured, every request
+     * is rejected (503) rather than silently allowed through unauthenticated.
+     */
+    private boolean verifyServiceKey(HttpExchange exchange) throws IOException {
+        if (networkSharedSecret == null || networkSharedSecret.isBlank()) {
+            byte[] body = "{\"error\":\"network.shared-secret is not configured on this server\"}".getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
+            exchange.sendResponseHeaders(503, body.length);
+            try (OutputStream out = exchange.getResponseBody()) { out.write(body); }
+            return false;
+        }
+
+        String provided = exchange.getRequestHeaders().getFirst(NETWORK_KEY_HEADER);
+        boolean valid = provided != null && MessageDigest.isEqual(
+                provided.getBytes(StandardCharsets.UTF_8),
+                networkSharedSecret.getBytes(StandardCharsets.UTF_8));
+        if (valid) return true;
+
+        byte[] body = "{\"error\":\"Unauthorized\"}".getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
+        exchange.sendResponseHeaders(401, body.length);
+        try (OutputStream out = exchange.getResponseBody()) { out.write(body); }
+        return false;
     }
 
     @Override public boolean isRunning()                 { return running; }
