@@ -15,7 +15,9 @@ IWebService web = rsp.getProvider();
 ```java
 public interface IWebService {
     void registerModule(Plugin plugin, HttpHandler handler);
+    void registerServiceModule(Plugin plugin, HttpHandler handler);
     void unregisterModule(Plugin plugin);
+    void unregisterServiceModule(Plugin plugin);
     boolean isRunning();
     int getPort();
     String getBindAddress();
@@ -28,12 +30,16 @@ public interface IWebService {
 | Method | Description |
 |---|---|
 | `registerModule(plugin, handler)` | Mounts `handler` at `/swagapi/<plugin-name-lowercased>/`. A no-trailing-slash redirect is installed automatically. The mount point is already gated by SwagAPI's session — your handler only runs for authenticated requests (or always, if auth is disabled). |
-| `unregisterModule(plugin)` | Removes your handler. Call this from `onDisable()`. Silently no-ops if nothing was registered or the server isn't running. |
+| `registerServiceModule(plugin, handler)` | Mounts `handler` at `/swagnet/<plugin-name-lowercased>/` for **server-to-server** calls between Swag-ecosystem servers (e.g. a hub server reading another server's stats). Not gated by the human session system — see [Server-to-server (`/swagnet/`) auth](#server-to-server-swagnet-auth) below. |
+| `unregisterModule(plugin)` | Removes your `registerModule` handler. Call this from `onDisable()`. Silently no-ops if nothing was registered or the server isn't running. Does not affect a `registerServiceModule` registration for the same plugin. |
+| `unregisterServiceModule(plugin)` | Removes your `registerServiceModule` handler. Call this from `onDisable()`. Silently no-ops if nothing was registered or the server isn't running. Does not affect a `registerModule` registration for the same plugin. |
 | `isRunning()` | Whether the HTTP server is currently accepting connections. |
 | `getPort()` / `getBindAddress()` | The configured port/bind address, even if the server failed to start. |
 | `getRegisteredModules()` | Snapshot list of registered module names, in registration order. |
 | `getPluginUrl(moduleName)` | Builds the full browser URL for a module, e.g. `http://192.168.1.10:8080/swagapi/swagfishing/`. |
 | `getSessionUsername(exchange)` | Resolves who's logged in for the current request. Since your module route is already gated, this is normally just for personalizing output ("Signed in as X"), not re-checking auth. |
+
+A plugin can use both `registerModule` and `registerServiceModule` at once — they're independent lifecycles (e.g. a dashboard tab owned by one module, a network-service API owned by another) that enable/disable separately.
 
 ## Registering a module
 
@@ -57,6 +63,38 @@ public void onDisable() {
             Bukkit.getServicesManager().getRegistration(IWebService.class);
     if (rsp != null) rsp.getProvider().unregisterModule(this);
 }
+```
+
+## Server-to-server (`/swagnet/`) auth
+
+`registerServiceModule` mounts are meant for calls **between servers** — e.g. a hub server polling another server's player stats — where a browser session cookie is meaningless. Instead of the login system, every `/swagnet/` request must carry an `X-SwagNetwork-Key` header matching this server's `network.shared-secret` config value exactly (compared with a constant-time comparison to avoid timing attacks).
+
+```java
+RegisteredServiceProvider<IWebService> rsp =
+        Bukkit.getServicesManager().getRegistration(IWebService.class);
+if (rsp != null) {
+    rsp.getProvider().registerServiceModule(this, exchange -> {
+        String path = exchange.getRequestURI().getPath(); // prefix already stripped
+        // handle the request — path arrives as e.g. "/stats" for
+        // a request to /swagnet/myplugin/stats
+    });
+}
+```
+
+The caller (e.g. the hub server) sends the same header on its outgoing request:
+
+```
+GET /swagnet/swagfishing/stats
+X-SwagNetwork-Key: <shared secret>
+```
+
+* If `network.shared-secret` is **blank** (the default), every `/swagnet/` route rejects **all** requests with `503` — this fails closed, not open, so forgetting to configure the secret can never accidentally leave these routes unauthenticated.
+* If the header is missing or doesn't match, the route returns `401`.
+* The secret must be configured identically on every server that should trust each other:
+
+```yaml
+network:
+  shared-secret: ""
 ```
 
 ## Checking login status from the browser (client-side)
@@ -89,7 +127,8 @@ This endpoint never redirects, so a page can detect an expired session itself an
 | `GET /swagapi/modules` | — | JSON array of registered module names. |
 | `GET /swagapi/auth/status` | — | Never-redirecting login-status JSON, for client-side polling. |
 | `GET /swagapi/shared/topbar.css` / `.js` | — | The shared navigation chrome every dashboard page includes by reference. |
-| `/swagapi/<your-plugin>/...` | Yes | Your registered module. |
+| `/swagapi/<your-plugin>/...` | Yes | Your registered module (`registerModule`). |
+| `/swagnet/<your-plugin>/...` | No (shared-secret) | Your registered network-service module (`registerServiceModule`) — see [Server-to-server (`/swagnet/`) auth](#server-to-server-swagnet-auth). |
 
 ## Configuration
 
@@ -104,6 +143,9 @@ web-server:
     session-days: 30
     setup-token-minutes: 15
     remind-ops-on-join: true
+
+network:
+  shared-secret: ""
 ```
 
 | Key | Effect |
@@ -115,6 +157,7 @@ web-server:
 | `auth.session-days` | Login session lifetime; each authenticated request slides the expiry forward. |
 | `auth.setup-token-minutes` | How long a `/swagapi web setup` or password-reset link stays valid. |
 | `auth.remind-ops-on-join` | Nags OPs with `swagapi.web` and no linked account, once per join, with a clickable account-setup link. |
+| `network.shared-secret` | Shared secret required on the `X-SwagNetwork-Key` header for every `/swagnet/` request. Blank (the default) disables **all** `/swagnet/` routes — they fail closed, not open. Must match exactly on every server that should trust each other. |
 
 ## Session mechanics
 
