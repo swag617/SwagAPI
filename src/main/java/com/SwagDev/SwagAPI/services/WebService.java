@@ -59,6 +59,7 @@ public class WebService implements IWebService {
     private volatile boolean running = false;
     private int port;
     private String bindAddress;
+    private String publicAddress;
 
     private final CopyOnWriteArrayList<String> registeredModules = new CopyOnWriteArrayList<>();
 
@@ -109,9 +110,10 @@ public class WebService implements IWebService {
             return;
         }
 
-        port        = plugin.getConfig().getInt("web-server.port", 8080);
-        bindAddress = plugin.getConfig().getString("web-server.bind-address", "0.0.0.0");
-        int threads = plugin.getConfig().getInt("web-server.threads", 8);
+        port          = plugin.getConfig().getInt("web-server.port", 8080);
+        bindAddress   = plugin.getConfig().getString("web-server.bind-address", "0.0.0.0");
+        publicAddress = plugin.getConfig().getString("web-server.public-address", "").trim();
+        int threads   = plugin.getConfig().getInt("web-server.threads", 8);
 
         authEnabled      = plugin.getConfig().getBoolean("web-server.auth.enabled", true);
         int sessionDays  = plugin.getConfig().getInt("web-server.auth.session-days", 30);
@@ -1956,7 +1958,18 @@ public class WebService implements IWebService {
         return null;
     }
 
+    /**
+     * The host used in every URL SwagAPI shows to admins (home dashboard, module links, setup
+     * and password-reset links). If {@code web-server.public-address} is set, it always wins —
+     * that's the whole point of the setting: let an admin override the auto-detected address
+     * with the server's actual reachable hostname/IP for non-LAN admins. Otherwise falls back
+     * to scanning local network interfaces for a LAN IP, which is only ever correct for admins
+     * on the same LAN as the server.
+     */
     private String resolveDisplayIp() {
+        if (publicAddress != null && !publicAddress.isBlank()) {
+            return publicAddress;
+        }
         try {
             Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
             if (interfaces != null) {

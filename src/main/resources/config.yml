@@ -59,6 +59,13 @@ web-server:
   port: 8080
   # Bind address. Use 0.0.0.0 to listen on all interfaces, or a specific IP to restrict access.
   bind-address: "0.0.0.0"
+  # The host/IP shown in every link the web panel generates (/swagapi web, module links,
+  # account setup and password reset links). Leave blank to auto-detect, which picks the
+  # server's LAN IP (e.g. 10.x.x.x/192.168.x.x) — fine for admins on the same LAN as the
+  # server, but wrong for anyone connecting from outside it. Set this to the server's actual
+  # reachable hostname or public IP (and make sure the port above is forwarded/open) so
+  # non-LAN admins get a link that actually works for them.
+  public-address: ""
   # Number of threads in the HTTP handler pool. Increase under heavy API load.
   threads: 8
   auth:
