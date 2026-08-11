@@ -123,5 +123,15 @@
                 </executions>
             </plugin>
         </plugins>
+
+        <resources>
+            <!-- Filter plugin.yml/config.yml for ${project.version} substitution, so the version
+                 baked into the jar's plugin.yml always matches pom.xml — no more manually keeping
+                 a hardcoded plugin.yml version string in sync with every version bump. -->
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>true</filtering>
+            </resource>
+        </resources>
     </build>
 </project>
