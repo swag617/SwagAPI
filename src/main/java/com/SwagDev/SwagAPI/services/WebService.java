@@ -89,7 +89,7 @@ public class WebService implements IWebService {
     /** UUID → username, for a reset requested while the player was offline. Delivered on their next join. */
     private final ConcurrentHashMap<UUID, String> pendingPasswordResets = new ConcurrentHashMap<>();
 
-    private record WebAccount(String username, String passwordHash, String salt, UUID linkedUuid, long created) {}
+    private record WebAccount(String username, String passwordHash, String salt, UUID linkedUuid, long created, long lastLogin) {}
     private record SetupToken(UUID uuid, long expiry) {}
     private record ResetToken(String username, long expiry) {}
     private record Session(String username, long expiry) {}
@@ -246,6 +246,11 @@ public class WebService implements IWebService {
                 handleAccountResetOther(exchange);
             });
 
+            server.createContext("/account/delete", exchange -> {
+                if (!verifySession(exchange)) return;
+                handleAccountDelete(exchange);
+            });
+
             // ── Built-in: /settings — editable web-panel auth settings + read-only info ──
             server.createContext("/settings", exchange -> {
                 if (!verifySession(exchange)) return;
@@ -253,6 +258,19 @@ public class WebService implements IWebService {
                     handleSettingsPost(exchange);
                 } else {
                     byte[] bytes = buildSettingsPage(null, null).getBytes(StandardCharsets.UTF_8);
+                    exchange.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
+                    exchange.sendResponseHeaders(200, bytes.length);
+                    try (OutputStream out = exchange.getResponseBody()) { out.write(bytes); }
+                }
+            });
+
+            // ── Built-in: /prefixes — per-plugin/global message-prefix overrides ──
+            server.createContext("/prefixes", exchange -> {
+                if (!verifySession(exchange)) return;
+                if ("POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                    handlePrefixesPost(exchange);
+                } else {
+                    byte[] bytes = buildPrefixesPage(null, null).getBytes(StandardCharsets.UTF_8);
                     exchange.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
                     exchange.sendResponseHeaders(200, bytes.length);
                     try (OutputStream out = exchange.getResponseBody()) { out.write(bytes); }
@@ -459,18 +477,22 @@ public class WebService implements IWebService {
     }
 
     /** Read-only summary of an account, for the /account page's admin table. */
-    public record AccountSummary(String username, String linkedPlayerName, long created) {}
+    public record AccountSummary(String username, String linkedPlayerName, long created, long lastLogin, boolean linkedPlayerOnline) {}
 
     /** All accounts, resolved to display-friendly form, sorted by username. Backs the /account page. */
     public List<AccountSummary> getAccountSummaries() {
         List<AccountSummary> result = new ArrayList<>();
         for (WebAccount acc : accounts.values()) {
             String playerName = acc.linkedUuid() != null ? Bukkit.getOfflinePlayer(acc.linkedUuid()).getName() : null;
-            result.add(new AccountSummary(acc.username(), playerName, acc.created()));
+            boolean online = acc.linkedUuid() != null && Bukkit.getPlayer(acc.linkedUuid()) != null;
+            result.add(new AccountSummary(acc.username(), playerName, acc.created(), acc.lastLogin(), online));
         }
         result.sort((a, b) -> a.username().compareToIgnoreCase(b.username()));
         return result;
     }
+
+    /** Total registered web-panel accounts — backs the /home overview card. */
+    public int getAccountCount() { return accounts.size(); }
 
     /**
      * Starts a password reset for the given account. If the account's linked player is
@@ -559,7 +581,7 @@ public class WebService implements IWebService {
         secureRandom.nextBytes(saltBytes);
         String salt = Base64.getEncoder().encodeToString(saltBytes);
         String hash = hashPassword(password, saltBytes);
-        accounts.put(username.toLowerCase(), new WebAccount(username, hash, salt, linkedUuid, System.currentTimeMillis()));
+        accounts.put(username.toLowerCase(), new WebAccount(username, hash, salt, linkedUuid, System.currentTimeMillis(), 0L));
         saveAccounts();
     }
 
@@ -572,9 +594,38 @@ public class WebService implements IWebService {
         String salt = Base64.getEncoder().encodeToString(saltBytes);
         String hash = hashPassword(newPassword, saltBytes);
         accounts.put(username.toLowerCase(),
-                new WebAccount(existing.username(), hash, salt, existing.linkedUuid(), existing.created()));
+                new WebAccount(existing.username(), hash, salt, existing.linkedUuid(), existing.created(), existing.lastLogin()));
         saveAccounts();
     }
+
+    /** Stamps "now" as the account's last-login time — called on every successful /login. */
+    private synchronized void recordLogin(String username) {
+        WebAccount existing = accounts.get(username.toLowerCase());
+        if (existing == null) return;
+        accounts.put(username.toLowerCase(),
+                new WebAccount(existing.username(), existing.passwordHash(), existing.salt(),
+                        existing.linkedUuid(), existing.created(), System.currentTimeMillis()));
+        saveAccounts();
+    }
+
+    /**
+     * Permanently removes an account. Refuses to delete the last remaining account (would lock
+     * every admin out of the panel with no way back in short of editing accounts.yml by hand)
+     * and refuses to let an account delete itself (use another account, or edit accounts.yml,
+     * to remove your own — prevents an accidental self-lockout mid-session).
+     */
+    private synchronized DeleteOutcome deleteAccount(String username, String requestedBy) {
+        String key = username.toLowerCase();
+        if (!accounts.containsKey(key)) return DeleteOutcome.NOT_FOUND;
+        if (key.equals(requestedBy.toLowerCase())) return DeleteOutcome.CANNOT_DELETE_SELF;
+        if (accounts.size() <= 1) return DeleteOutcome.LAST_ACCOUNT;
+        accounts.remove(key);
+        saveAccounts();
+        sessions.entrySet().removeIf(e -> e.getValue().username().equalsIgnoreCase(username));
+        return DeleteOutcome.DELETED;
+    }
+
+    private enum DeleteOutcome { DELETED, NOT_FOUND, CANNOT_DELETE_SELF, LAST_ACCOUNT }
 
     private boolean verifyLogin(String username, String password) {
         WebAccount acc = accounts.get(username.toLowerCase());
@@ -615,7 +666,8 @@ public class WebService implements IWebService {
             String uuidStr = acc.getString("uuid");
             UUID uuid = uuidStr != null ? UUID.fromString(uuidStr) : null;
             long created = acc.getLong("created", System.currentTimeMillis());
-            accounts.put(key.toLowerCase(), new WebAccount(key, hash, salt, uuid, created));
+            long lastLogin = acc.getLong("last-login", 0L);
+            accounts.put(key.toLowerCase(), new WebAccount(key, hash, salt, uuid, created, lastLogin));
         }
     }
 
@@ -627,6 +679,7 @@ public class WebService implements IWebService {
             yaml.set(base + ".salt", acc.salt());
             yaml.set(base + ".uuid", acc.linkedUuid() != null ? acc.linkedUuid().toString() : null);
             yaml.set(base + ".created", acc.created());
+            yaml.set(base + ".last-login", acc.lastLogin());
         }
         try {
             yaml.save(accountsFile);
@@ -780,6 +833,7 @@ public class WebService implements IWebService {
 
         if (verifyLogin(username, password)) {
             WebAccount acc = accounts.get(username.toLowerCase());
+            recordLogin(acc.username());
             String token = generateToken();
             sessions.put(token, new Session(acc.username(), System.currentTimeMillis() + sessionDurationMs));
             exchange.getResponseHeaders().add("Set-Cookie",
@@ -1028,6 +1082,36 @@ public class WebService implements IWebService {
         try (OutputStream out = exchange.getResponseBody()) { out.write(bytes); }
     }
 
+    private void handleAccountDelete(HttpExchange exchange) throws IOException {
+        byte[] bodyBytes = exchange.getRequestBody().readAllBytes();
+        String body = new String(bodyBytes, StandardCharsets.UTF_8);
+
+        String username = "";
+        for (String pair : body.split("&")) {
+            String[] kv = pair.split("=", 2);
+            if (kv.length == 2 && "username".equals(URLDecoder.decode(kv[0], StandardCharsets.UTF_8))) {
+                username = URLDecoder.decode(kv[1], StandardCharsets.UTF_8);
+            }
+        }
+
+        Session session = lookupSession(exchange, false);
+        String requestedBy = session != null ? session.username() : "";
+        DeleteOutcome outcome = deleteAccount(username, requestedBy);
+        String error = null, success = null;
+        switch (outcome) {
+            case DELETED -> success = "Deleted account '" + username + "'.";
+            case NOT_FOUND -> error = "No account named '" + username + "'.";
+            case CANNOT_DELETE_SELF -> error = "You can't delete the account you're currently signed in as.";
+            case LAST_ACCOUNT -> error = "Can't delete the last remaining account — the panel would be unreachable.";
+        }
+        plugin.getLogger().info("[SwagAPI] Account deletion for '" + username + "' requested by '" + requestedBy + "' -> " + outcome);
+
+        byte[] bytes = buildAccountPage(exchange, error, success).getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
+        exchange.sendResponseHeaders(200, bytes.length);
+        try (OutputStream out = exchange.getResponseBody()) { out.write(bytes); }
+    }
+
     private static final String[] WEB_AUTH_SECTION = {"web-server", "auth"};
 
     private void handleSettingsPost(HttpExchange exchange) throws IOException {
@@ -1076,6 +1160,51 @@ public class WebService implements IWebService {
         try (OutputStream out = exchange.getResponseBody()) { out.write(bytes); }
     }
 
+    /**
+     * Every installed plugin whose name starts with "Swag" — the same convention every other
+     * cross-plugin auto-detection in this ecosystem already relies on (see e.g. {@code
+     * NetworkModule}'s own "no cross-server protocol to confirm the other side is specifically
+     * running X" caveat). A plugin not yet wired up to {@link com.SwagDev.SwagAPI.api.IPrefixService#getPrefix}
+     * simply won't visibly change when its row here is edited — this page doesn't know which
+     * plugins have actually integrated it, only which are installed.
+     */
+    private java.util.List<String> detectSwagPlugins() {
+        java.util.List<String> names = new java.util.ArrayList<>();
+        for (var p : plugin.getServer().getPluginManager().getPlugins()) {
+            if (p.getName().startsWith("Swag")) names.add(p.getName());
+        }
+        names.sort(String::compareTo);
+        return names;
+    }
+
+    private void handlePrefixesPost(HttpExchange exchange) throws IOException {
+        byte[] bodyBytes = exchange.getRequestBody().readAllBytes();
+        String body = new String(bodyBytes, StandardCharsets.UTF_8);
+
+        Map<String, String> form = new java.util.LinkedHashMap<>();
+        for (String pair : body.split("&")) {
+            if (pair.isEmpty()) continue;
+            String[] kv = pair.split("=", 2);
+            String key = URLDecoder.decode(kv[0], StandardCharsets.UTF_8);
+            String value = kv.length > 1 ? URLDecoder.decode(kv[1], StandardCharsets.UTF_8) : "";
+            form.put(key, value);
+        }
+
+        var prefixService = plugin.getPrefixService();
+        prefixService.setOverride(PrefixService.globalKey(), normalizeToMiniMessage(form.getOrDefault("global", "").trim()));
+        for (String name : detectSwagPlugins()) {
+            String value = normalizeToMiniMessage(form.getOrDefault("plugin__" + name, "").trim());
+            prefixService.setOverride(name, value);
+        }
+
+        plugin.getLogger().info("[SwagAPI] Message prefix overrides updated via /prefixes.");
+
+        byte[] bytes = buildPrefixesPage(null, "Prefixes saved.").getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
+        exchange.sendResponseHeaders(200, bytes.length);
+        try (OutputStream out = exchange.getResponseBody()) { out.write(bytes); }
+    }
+
     // ─── JSON builders ───────────────────────────────────────────────────────
 
     private String buildInfoJson() {
@@ -1116,8 +1245,35 @@ public class WebService implements IWebService {
         String version = Bukkit.getVersion();
         String motd    = Bukkit.getServer().getMotd();
 
-        StringBuilder pluginsArr = new StringBuilder("[");
+        double cpuLoad = -1;
+        try {
+            var os = ManagementFactory.getOperatingSystemMXBean();
+            if (os instanceof com.sun.management.OperatingSystemMXBean sunOs) {
+                cpuLoad = sunOs.getProcessCpuLoad();
+            }
+        } catch (Throwable ignored) { /* not available on every JVM/OS — cpu card just shows "—" */ }
+
+        long diskFreeGb  = new File(".").getUsableSpace() / (1024L * 1024L * 1024L);
+        long diskTotalGb = new File(".").getTotalSpace() / (1024L * 1024L * 1024L);
+
+        int prefixOverrides = plugin.getPrefixService() != null
+                ? plugin.getPrefixService().getAllOverrides().size() : 0;
+
+        StringBuilder playersArr = new StringBuilder("[");
         boolean first = true;
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            if (!first) playersArr.append(",");
+            playersArr.append("{\"name\":\"").append(escapeJson(p.getName()))
+                      .append("\",\"uuid\":\"").append(p.getUniqueId())
+                      .append("\",\"world\":\"").append(escapeJson(p.getWorld().getName()))
+                      .append("\",\"gamemode\":\"").append(p.getGameMode().name())
+                      .append("\"}");
+            first = false;
+        }
+        playersArr.append("]");
+
+        StringBuilder pluginsArr = new StringBuilder("[");
+        first = true;
         for (Plugin p : Bukkit.getPluginManager().getPlugins()) {
             if (!first) pluginsArr.append(",");
             pluginsArr.append("{\"name\":\"").append(escapeJson(p.getName()))
@@ -1141,15 +1297,20 @@ public class WebService implements IWebService {
 
         return "{"
             + "\"players\":{\"online\":" + online + ",\"max\":" + maxPlayers + "},"
+            + "\"onlinePlayers\":" + playersArr + ","
             + "\"tps\":{\"1m\":" + String.format("%.1f", tps1m)
                 + ",\"5m\":" + String.format("%.1f", tps5m)
                 + ",\"15m\":" + String.format("%.1f", tps15m) + "},"
             + "\"memory\":{\"used\":" + usedMb + ",\"max\":" + maxMb + "},"
+            + "\"cpu\":" + (cpuLoad >= 0 ? String.format("%.2f", cpuLoad) : "-1") + ","
+            + "\"disk\":{\"free\":" + diskFreeGb + ",\"total\":" + diskTotalGb + "},"
             + "\"uptime\":" + uptimeMs + ","
             + "\"version\":\"" + escapeJson(version) + "\","
             + "\"motd\":\"" + escapeJson(motd) + "\","
             + "\"port\":" + port + ","
             + "\"sessions\":" + sessions.size() + ","
+            + "\"accounts\":" + getAccountCount() + ","
+            + "\"prefixOverrides\":" + prefixOverrides + ","
             + "\"modules\":" + buildModulesJson() + ","
             + "\"plugins\":" + pluginsArr + ","
             + "\"worlds\":" + worldsArr
@@ -1548,6 +1709,9 @@ public class WebService implements IWebService {
             .data-table tr:last-child td{border-bottom:none}
             .data-table td form{margin:0}
             .hint{color:var(--text-dim);font-size:.78rem;margin-top:.4rem}
+            .badge{display:inline-block;font-size:.64rem;font-weight:600;padding:.15rem .5rem;border-radius:5px;letter-spacing:.03em;vertical-align:middle}
+            .badge-green{background:rgba(95,224,95,.13);color:var(--green)}
+            .badge-gray{background:rgba(139,139,150,.13);color:var(--text-muted)}
             </style>
             """;
 
@@ -1559,16 +1723,33 @@ public class WebService implements IWebService {
                 : success != null ? "<div class=\"banner success\">" + escapeHtmlAttr(success) + "</div>"
                 : "";
 
+        java.time.format.DateTimeFormatter dateFmt = java.time.format.DateTimeFormatter.ofPattern("MMM d, yyyy");
         StringBuilder rows = new StringBuilder();
         for (AccountSummary acc : getAccountSummaries()) {
-            String linked = acc.linkedPlayerName() != null ? escapeHtmlAttr(acc.linkedPlayerName()) : "&mdash;";
-            String created = java.time.format.DateTimeFormatter.ofPattern("MMM d, yyyy")
-                    .format(java.time.Instant.ofEpochMilli(acc.created()).atZone(java.time.ZoneId.systemDefault()));
-            rows.append("<tr><td>").append(escapeHtmlAttr(acc.username())).append("</td><td>").append(linked)
-                    .append("</td><td>").append(created).append("</td><td>")
+            boolean isSelf = acc.username().equalsIgnoreCase(currentUsername);
+            String linked = acc.linkedPlayerName() != null
+                    ? escapeHtmlAttr(acc.linkedPlayerName()) + (acc.linkedPlayerOnline()
+                        ? " <span class=\"badge badge-green\">Online</span>" : " <span class=\"badge badge-gray\">Offline</span>")
+                    : "&mdash;";
+            String created = dateFmt.format(java.time.Instant.ofEpochMilli(acc.created()).atZone(java.time.ZoneId.systemDefault()));
+            String lastLogin = acc.lastLogin() > 0
+                    ? dateFmt.format(java.time.Instant.ofEpochMilli(acc.lastLogin()).atZone(java.time.ZoneId.systemDefault()))
+                    : "Never";
+            rows.append("<tr><td>").append(escapeHtmlAttr(acc.username()))
+                    .append(isSelf ? " <span class=\"badge badge-gray\">You</span>" : "")
+                    .append("</td><td>").append(linked)
+                    .append("</td><td>").append(created)
+                    .append("</td><td>").append(lastLogin)
+                    .append("</td><td style=\"display:flex;gap:.4rem\">")
                     .append("<form method=\"POST\" action=\"/account/reset\"><input type=\"hidden\" name=\"username\" value=\"")
-                    .append(escapeHtmlAttr(acc.username())).append("\"><button type=\"submit\" class=\"btn btn-ghost btn-sm\">Send Reset Link</button></form>")
-                    .append("</td></tr>");
+                    .append(escapeHtmlAttr(acc.username())).append("\"><button type=\"submit\" class=\"btn btn-ghost btn-sm\">Send Reset Link</button></form>");
+            if (!isSelf) {
+                rows.append("<form method=\"POST\" action=\"/account/delete\" onsubmit=\"return confirm('Permanently delete the account &quot;")
+                        .append(escapeHtmlAttr(acc.username())).append("&quot;? This cannot be undone.');\">")
+                        .append("<input type=\"hidden\" name=\"username\" value=\"").append(escapeHtmlAttr(acc.username()))
+                        .append("\"><button type=\"submit\" class=\"btn btn-ghost btn-sm\" style=\"color:var(--danger)\">Delete</button></form>");
+            }
+            rows.append("</td></tr>");
         }
 
         return ("""
@@ -1606,16 +1787,18 @@ public class WebService implements IWebService {
                     </form>
                   </div>
 
-                  <h3>All Accounts</h3>
+                  <h3>All Accounts <span style="text-transform:none;letter-spacing:0;font-family:var(--font)">({{ACCOUNT_COUNT}} registered)</span></h3>
                   <table class="data-table">
-                    <thead><tr><th>Username</th><th>Linked Player</th><th>Created</th><th></th></tr></thead>
+                    <thead><tr><th>Username</th><th>Linked Player</th><th>Created</th><th>Last Login</th><th></th></tr></thead>
                     <tbody>{{ROWS}}</tbody>
                   </table>
                 </div>
                 <script src="/swagapi/shared/topbar.js"></script>
                 </body>
                 </html>
-                """).replace("{{BANNER}}", banner).replace("{{CURRENT}}", escapeHtmlAttr(currentUsername)).replace("{{ROWS}}", rows.toString());
+                """).replace("{{BANNER}}", banner).replace("{{CURRENT}}", escapeHtmlAttr(currentUsername))
+                    .replace("{{ROWS}}", rows.toString())
+                    .replace("{{ACCOUNT_COUNT}}", String.valueOf(getAccountCount()));
     }
 
     private String buildSettingsPage(String error, String success) {
@@ -1695,6 +1878,282 @@ public class WebService implements IWebService {
                     .replace("{{INFO_ROWS}}", infoRows);
     }
 
+    /**
+     * Lets an admin set ONE global message prefix that applies to every wired-up Swag plugin,
+     * plus per-plugin overrides for a chosen subset — see {@link com.SwagDev.SwagAPI.api.IPrefixService}
+     * for the exact precedence (per-plugin wins over global wins over that plugin's own
+     * unwired-in default). Values are MiniMessage strings (e.g. {@code <gold>[FleaMC] </gold>}),
+     * matching the convention every Swag plugin's own text-formatting already uses.
+     */
+    private static final String PREFIXES_PAGE_STYLE = """
+            <style>
+            .toolbar{display:flex;flex-wrap:wrap;gap:1.25rem;align-items:flex-start}
+            .toolbar-group{display:flex;flex-direction:column;gap:.5rem}
+            .toolbar-group .tg-label{font-family:var(--mono);font-size:.62rem;text-transform:uppercase;letter-spacing:.08em;color:var(--text-muted)}
+            .swatches{display:flex;flex-wrap:wrap;gap:.35rem;max-width:280px}
+            .swatch{width:24px;height:24px;border-radius:6px;border:1px solid var(--border);cursor:pointer;padding:0;transition:transform .1s,border-color .1s}
+            .swatch:hover{transform:scale(1.15);border-color:var(--text)}
+            .fmt-btn{padding:.35rem .7rem;border-radius:6px;border:1px solid var(--border-dim);background:var(--chip-bg);color:var(--text);font-size:.78rem;cursor:pointer;transition:border-color .1s}
+            .fmt-btn:hover{border-color:var(--purple)}
+            .hex-row{display:flex;align-items:center;gap:.5rem}
+            .hex-row input[type=color]{width:36px;height:32px;padding:2px;border-radius:6px;border:1px solid var(--border);background:var(--bg);cursor:pointer}
+            .gen-link{display:inline-flex;align-items:center;gap:.4rem;font-size:.8rem;color:var(--purple-muted);text-decoration:none;padding:.4rem .7rem;border:1px solid var(--border-dim);border-radius:6px;background:var(--chip-bg)}
+            .gen-link:hover{color:var(--blue);border-color:var(--border-accent,rgba(118,75,162,.4))}
+            .preview{margin-top:.35rem;padding:.5rem .7rem;background:var(--bg);border:1px dashed var(--border);border-radius:6px;font-size:.85rem;min-height:1.3em;word-break:break-word}
+            .preview:empty::before,.preview.is-empty::before{content:'(no override — falls through to global / this plugin\\'s own default)';color:var(--text-dim);font-style:italic}
+            .prefix-row{display:grid;grid-template-columns:150px 1fr;gap:.6rem 1rem;align-items:start;padding:.85rem 0;border-bottom:1px solid var(--border-dim)}
+            .prefix-row:last-child{border-bottom:none}
+            .prefix-row .pr-name{font-weight:600;font-size:.85rem;padding-top:.55rem}
+            .prefix-row input{width:100%}
+            @media(max-width:640px){.prefix-row{grid-template-columns:1fr}}
+            </style>
+            """;
+
+    private String buildPrefixesPage(String error, String success) {
+        String banner = error != null ? "<div class=\"banner error\">" + escapeHtmlAttr(error) + "</div>"
+                : success != null ? "<div class=\"banner success\">" + escapeHtmlAttr(success) + "</div>"
+                : "";
+
+        var prefixService = plugin.getPrefixService();
+        Map<String, String> overrides = prefixService.getAllOverrides();
+        String globalValue = overrides.getOrDefault(PrefixService.globalKey(), "");
+
+        StringBuilder rows = new StringBuilder();
+        for (String name : detectSwagPlugins()) {
+            String value = overrides.getOrDefault(name, "");
+            String id = "plugin-" + escapeHtmlAttr(name);
+            rows.append("<div class=\"prefix-row\"><div class=\"pr-name\">").append(escapeHtmlAttr(name)).append("</div><div>")
+                    .append("<input id=\"").append(id).append("\" class=\"prefix-input\" name=\"plugin__").append(escapeHtmlAttr(name))
+                    .append("\" type=\"text\" value=\"").append(escapeHtmlAttr(value))
+                    .append("\" placeholder=\"(no override — uses global, or this plugin's own default)\">")
+                    .append("<div class=\"preview\" data-preview-for=\"").append(id).append("\"></div>")
+                    .append("</div></div>");
+        }
+
+        return ("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+                <title>SwagAPI — Message Prefixes</title>
+                <link rel="preconnect" href="https://fonts.googleapis.com">
+                <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+                <link rel="stylesheet" href="/swagapi/shared/topbar.css">
+                <script>window.SWAG_TOPBAR = {plugin: "Message Prefixes"};</script>
+                """ + SUB_PAGE_STYLE + PREFIXES_PAGE_STYLE + """
+                </head>
+                <body>
+                <div class="content">
+                  <h2>Message Prefixes</h2>
+                  {{BANNER}}
+                  <p class="hint" style="margin-bottom:1.1rem">
+                    Type <code>&amp;</code> or <code>&sect;</code> colour codes (e.g. <code>&amp;6</code>), MiniMessage
+                    tags (e.g. <code>&lt;gold&gt;</code>), or shorthand hex (<code>&amp;#FFAA00</code>) directly — everything
+                    gets normalized automatically when you save. Only takes effect for plugins wired up to read it; editing
+                    a row that isn't does nothing until that plugin's own code consults this page's setting.
+                  </p>
+
+                  <h3>Prefix Builder</h3>
+                  <div class="card">
+                    <div class="toolbar">
+                      <div class="toolbar-group">
+                        <span class="tg-label">Colors (click a field first, then a swatch)</span>
+                        <div class="swatches" id="color-swatches"></div>
+                      </div>
+                      <div class="toolbar-group">
+                        <span class="tg-label">Hex Picker</span>
+                        <div class="hex-row">
+                          <input type="color" id="hex-picker" value="#ffaa00">
+                          <button type="button" class="fmt-btn" id="hex-insert">Insert Hex</button>
+                        </div>
+                      </div>
+                      <div class="toolbar-group">
+                        <span class="tg-label">Formatting</span>
+                        <div class="swatches">
+                          <button type="button" class="fmt-btn" data-tag="bold">Bold</button>
+                          <button type="button" class="fmt-btn" data-tag="italic">Italic</button>
+                          <button type="button" class="fmt-btn" data-tag="underlined">Underline</button>
+                          <button type="button" class="fmt-btn" data-tag="strikethrough">Strike</button>
+                          <button type="button" class="fmt-btn" data-tag="reset">Reset</button>
+                        </div>
+                      </div>
+                      <div class="toolbar-group">
+                        <span class="tg-label">Need more control?</span>
+                        <a class="gen-link" href="https://webui.advntr.dev/" target="_blank" rel="noopener">&#127912; Open MiniMessage Generator &#8599;</a>
+                      </div>
+                    </div>
+                  </div>
+
+                  <form method="POST" action="/prefixes">
+                    <h3>Global Default</h3>
+                    <div class="card">
+                      <div class="form-group" style="margin-bottom:0">
+                        <label for="global">Applies to every plugin below with no override of its own — leave blank to let each plugin keep showing its own name</label>
+                        <input id="global" class="prefix-input" name="global" type="text" value="{{GLOBAL_VALUE}}" placeholder="(none — each plugin uses its own default)">
+                        <div class="preview" data-preview-for="global"></div>
+                      </div>
+                    </div>
+
+                    <h3>Per-Plugin Overrides <span style="text-transform:none;letter-spacing:0;font-family:var(--font)">({{PLUGIN_COUNT}} detected)</span></h3>
+                    <div class="card">
+                      {{ROWS}}
+                    </div>
+
+                    <div style="margin-top:1.25rem"><button type="submit" class="btn btn-primary">Save Prefixes</button></div>
+                  </form>
+                </div>
+                <script src="/swagapi/shared/topbar.js"></script>
+                <script>
+                (function(){
+                  var COLORS = [
+                    ['Black','#000000'],['Dark Blue','#0000AA'],['Dark Green','#00AA00'],['Dark Aqua','#00AAAA'],
+                    ['Dark Red','#AA0000'],['Dark Purple','#AA00AA'],['Gold','#FFAA00'],['Gray','#AAAAAA'],
+                    ['Dark Gray','#555555'],['Blue','#5555FF'],['Green','#55FF55'],['Aqua','#55FFFF'],
+                    ['Red','#FF5555'],['Light Purple','#FF55FF'],['Yellow','#FFFF55'],['White','#FFFFFF']
+                  ];
+                  var NAMED_TAGS = {'#000000':'black','#0000AA':'dark_blue','#00AA00':'dark_green','#00AAAA':'dark_aqua',
+                    '#AA0000':'dark_red','#AA00AA':'dark_purple','#FFAA00':'gold','#AAAAAA':'gray','#555555':'dark_gray',
+                    '#5555FF':'blue','#55FF55':'green','#55FFFF':'aqua','#FF5555':'red','#FF55FF':'light_purple',
+                    '#FFFF55':'yellow','#FFFFFF':'white'};
+
+                  var sw = document.getElementById('color-swatches');
+                  COLORS.forEach(function(c){
+                    var b = document.createElement('button');
+                    b.type = 'button'; b.className = 'swatch'; b.title = c[0];
+                    b.style.background = c[1];
+                    b.addEventListener('click', function(){ insertAtCursor('<' + NAMED_TAGS[c[1]] + '>'); });
+                    sw.appendChild(b);
+                  });
+
+                  document.querySelectorAll('.fmt-btn[data-tag]').forEach(function(b){
+                    b.addEventListener('click', function(){ insertAtCursor('<' + b.getAttribute('data-tag') + '>'); });
+                  });
+
+                  document.getElementById('hex-insert').addEventListener('click', function(){
+                    var hex = document.getElementById('hex-picker').value;
+                    insertAtCursor('<#' + hex.replace('#','').toUpperCase() + '>');
+                  });
+
+                  var lastFocused = document.getElementById('global');
+                  document.querySelectorAll('.prefix-input').forEach(function(inp){
+                    inp.addEventListener('focus', function(){ lastFocused = inp; });
+                    inp.addEventListener('input', function(){ updatePreview(inp); });
+                  });
+
+                  function insertAtCursor(text){
+                    var inp = lastFocused || document.getElementById('global');
+                    var start = inp.selectionStart != null ? inp.selectionStart : inp.value.length;
+                    var end = inp.selectionEnd != null ? inp.selectionEnd : inp.value.length;
+                    inp.value = inp.value.slice(0, start) + text + inp.value.slice(end);
+                    inp.focus();
+                    inp.selectionStart = inp.selectionEnd = start + text.length;
+                    updatePreview(inp);
+                  }
+
+                  // Best-effort preview renderer — approximates legacy codes, shorthand hex, and the
+                  // common named/hex MiniMessage colour + formatting tags. Not a full MiniMessage
+                  // parser (gradients/click/hover just get stripped) — good enough to show roughly
+                  // what the saved prefix will look like in-game.
+                  var NAMED_COLORS = {black:'#000000',dark_blue:'#0000AA',dark_green:'#00AA00',dark_aqua:'#00AAAA',
+                    dark_red:'#AA0000',dark_purple:'#AA00AA',gold:'#FFAA00',gray:'#AAAAAA',dark_gray:'#555555',
+                    blue:'#5555FF',green:'#55FF55',aqua:'#55FFFF',red:'#FF5555',light_purple:'#FF55FF',
+                    yellow:'#FFFF55',white:'#FFFFFF'};
+                  var LEGACY_MAP = {'0':'black','1':'dark_blue','2':'dark_green','3':'dark_aqua','4':'dark_red',
+                    '5':'dark_purple','6':'gold','7':'gray','8':'dark_gray','9':'blue','a':'green','b':'aqua',
+                    'c':'red','d':'light_purple','e':'yellow','f':'white'};
+
+                  function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+                  function renderPreview(raw){
+                    if (!raw) return '';
+                    // Normalize legacy markers to MiniMessage tags first (mirrors the server-side save logic).
+                    raw = raw.replace(/[&§]#([0-9a-fA-F]{6})/g, function(_, h){ return '<#' + h + '>'; });
+                    raw = raw.replace(/[&§]([0-9a-fk-orA-FK-OR])/g, function(_, c){
+                      c = c.toLowerCase();
+                      if (c === 'r') return '<reset>';
+                      if (c === 'l') return '<bold>';
+                      if (c === 'o') return '<italic>';
+                      if (c === 'n') return '<underlined>';
+                      if (c === 'm') return '<strikethrough>';
+                      if (c === 'k') return '';
+                      return LEGACY_MAP[c] ? '<' + LEGACY_MAP[c] + '>' : '';
+                    });
+
+                    var out = '', styleStack = [];
+                    function currentStyle(){
+                      var color = null, bold = false, italic = false, underline = false, strike = false;
+                      styleStack.forEach(function(s){
+                        if (s.color) color = s.color;
+                        if (s.bold) bold = true;
+                        if (s.italic) italic = true;
+                        if (s.underline) underline = true;
+                        if (s.strike) strike = true;
+                        if (s.reset) { color = null; bold = italic = underline = strike = false; }
+                      });
+                      var css = [];
+                      if (color) css.push('color:' + color);
+                      if (bold) css.push('font-weight:700');
+                      if (italic) css.push('font-style:italic');
+                      var td = [];
+                      if (underline) td.push('underline');
+                      if (strike) td.push('line-through');
+                      if (td.length) css.push('text-decoration:' + td.join(' '));
+                      return css.join(';');
+                    }
+
+                    var i = 0;
+                    while (i < raw.length) {
+                      var tagMatch = /^<(\\/?)([a-zA-Z_]+)(:#?[0-9a-zA-Z_]+)?>/.exec(raw.slice(i));
+                      if (tagMatch) {
+                        var closing = tagMatch[1] === '/', tagName = tagMatch[2].toLowerCase();
+                        if (closing) {
+                          styleStack.pop();
+                        } else if (tagName === 'reset') {
+                          styleStack.push({reset:true});
+                        } else if (tagName === 'bold') { styleStack.push({bold:true}); }
+                        else if (tagName === 'italic' || tagName === 'em') { styleStack.push({italic:true}); }
+                        else if (tagName === 'underlined' || tagName === 'u') { styleStack.push({underline:true}); }
+                        else if (tagName === 'strikethrough' || tagName === 'st') { styleStack.push({strike:true}); }
+                        else if (tagName === 'obfuscated') { /* skip — not worth faking in a preview */ }
+                        else if (tagName === 'hex' || tagName.charAt(0) === '#') { styleStack.push({color:'#'+tagName.replace('#','')}); }
+                        else if (NAMED_COLORS[tagName]) { styleStack.push({color:NAMED_COLORS[tagName]}); }
+                        else { styleStack.push({}); } // unknown tag (gradient/click/hover/etc) — no visual effect
+                        i += tagMatch[0].length;
+                        continue;
+                      }
+                      var hexMatch = /^<#([0-9a-fA-F]{6})>/.exec(raw.slice(i));
+                      if (hexMatch) {
+                        styleStack.push({color:'#'+hexMatch[1]});
+                        i += hexMatch[0].length;
+                        continue;
+                      }
+                      var style = currentStyle();
+                      var ch = raw.charAt(i);
+                      out += style ? '<span style="' + style + '">' + esc(ch) + '</span>' : esc(ch);
+                      i++;
+                    }
+                    return out;
+                  }
+
+                  function updatePreview(inp){
+                    var box = document.querySelector('[data-preview-for="' + inp.id + '"]');
+                    if (!box) return;
+                    var html = renderPreview(inp.value);
+                    box.innerHTML = html;
+                    box.classList.toggle('is-empty', !inp.value);
+                  }
+
+                  document.querySelectorAll('.prefix-input').forEach(updatePreview);
+                })();
+                </script>
+                </body>
+                </html>
+                """).replace("{{BANNER}}", banner)
+                    .replace("{{GLOBAL_VALUE}}", escapeHtmlAttr(globalValue))
+                    .replace("{{PLUGIN_COUNT}}", String.valueOf(detectSwagPlugins().size()))
+                    .replace("{{ROWS}}", rows.toString());
+    }
+
     private String buildHomePage() {
         return """
                 <!DOCTYPE html>
@@ -1731,7 +2190,7 @@ public class WebService implements IWebService {
                 .sidebar-expand{display:none;position:fixed;left:.75rem;top:64px;z-index:900;align-items:center;justify-content:center;background:var(--chip-bg);border:1px solid var(--border-dim);color:var(--text-muted);border-radius:6px;width:26px;height:26px;cursor:pointer;font-size:.85rem}
                 .sidebar-expand.show{display:flex}
                 .main-area{flex:1;min-width:0;display:flex;flex-direction:column}
-                .content{max-width:1200px;margin:0 auto;padding:1.6rem;flex:1;width:100%}
+                .content{max-width:1560px;margin:0 auto;padding:1.6rem;flex:1;width:100%}
                 .sh{font-family:var(--mono);font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:var(--text-muted);margin-bottom:.9rem;padding-bottom:.5rem;border-bottom:1px solid var(--border-dim);display:flex;justify-content:space-between;align-items:center}
                 .sh:not(:first-child){margin-top:2.25rem}
                 .modules-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:1rem}
@@ -1745,10 +2204,11 @@ public class WebService implements IWebService {
                 .badge-red{background:rgba(236,95,95,.13);color:var(--danger)}
                 .badge-gray{background:rgba(139,139,150,.13);color:var(--text-muted)}
                 .empty{color:var(--text-muted);font-size:.85rem;padding:.5rem 0}
-                .info-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(175px,1fr));gap:.75rem}
+                .info-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:.75rem}
                 .info-card{background:var(--bg-card);border:1px solid var(--border-dim);border-radius:10px;padding:1rem}
                 .info-card .label{color:var(--text-muted);font-family:var(--mono);font-size:.62rem;text-transform:uppercase;letter-spacing:.08em;margin-bottom:.4rem}
                 .info-card .val{font-size:.9rem;font-weight:600;word-break:break-word;line-height:1.4}
+                .info-card .val a{color:inherit;text-decoration:none;border-bottom:1px dotted var(--text-dim)}
                 .data-table{width:100%;border-collapse:collapse;font-size:.85rem;background:var(--bg-card);border:1px solid var(--border-dim);border-radius:10px;overflow:hidden}
                 .data-table th{text-align:left;padding:.6rem .9rem;color:var(--text-muted);font-family:var(--mono);font-size:.62rem;text-transform:uppercase;letter-spacing:.08em;border-bottom:1px solid var(--border-dim);font-weight:600}
                 .data-table td{padding:.6rem .9rem;border-bottom:1px solid var(--border-dim)}
@@ -1758,6 +2218,24 @@ public class WebService implements IWebService {
                 .plugin-list{background:var(--bg-card);border:1px solid var(--border-dim);border-radius:10px;padding:1.1rem 1.25rem;display:flex;flex-wrap:wrap;gap:.5rem .9rem}
                 .plugin-ok{color:var(--green);font-size:.82rem;display:inline-flex;align-items:center;gap:.35rem}
                 .plugin-off{color:var(--danger);font-size:.82rem;display:inline-flex;align-items:center;gap:.35rem}
+                .dashboard-grid{display:grid;grid-template-columns:2fr 1fr;gap:1.5rem;align-items:start;margin-top:1.5rem}
+                @media(max-width:1050px){.dashboard-grid{grid-template-columns:1fr}}
+                .side-card{background:var(--bg-card);border:1px solid var(--border-dim);border-radius:12px;padding:1.1rem 1.25rem;margin-bottom:1.5rem}
+                .side-card h3{font-family:var(--mono);font-size:.62rem;text-transform:uppercase;letter-spacing:.08em;color:var(--text-muted);margin-bottom:.9rem;padding-bottom:.5rem;border-bottom:1px solid var(--border-dim);display:flex;justify-content:space-between}
+                .player-row{display:flex;align-items:center;gap:.6rem;padding:.5rem 0;border-bottom:1px solid var(--border-dim);font-size:.83rem}
+                .player-row:last-child{border-bottom:none}
+                .player-avatar{width:26px;height:26px;border-radius:6px;image-rendering:pixelated;flex-shrink:0;background:var(--chip-bg)}
+                .player-info{display:flex;flex-direction:column;min-width:0;flex:1}
+                .player-name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+                .player-meta{color:var(--text-dim);font-size:.7rem}
+                .quick-actions{display:flex;flex-direction:column;gap:.5rem}
+                .quick-actions a{display:flex;align-items:center;gap:.55rem;padding:.6rem .8rem;border-radius:8px;background:var(--chip-bg);border:1px solid var(--border-dim);color:var(--text);text-decoration:none;font-size:.82rem;transition:border-color .15s}
+                .quick-actions a:hover{border-color:rgba(118,75,162,.4)}
+                .stat-mini{display:flex;justify-content:space-between;align-items:center;padding:.5rem 0;border-bottom:1px solid var(--border-dim);font-size:.83rem}
+                .stat-mini:last-child{border-bottom:none}
+                .stat-mini a{color:var(--text-muted);text-decoration:none}
+                .stat-mini a:hover{color:var(--text)}
+                .stat-mini .v{font-weight:700;font-family:var(--mono)}
                 footer{padding:1.1rem 1.6rem;border-top:1px solid var(--border-dim);display:flex;justify-content:space-between;align-items:center;color:var(--text-dim);font-size:.76rem;flex-shrink:0;flex-wrap:wrap;gap:.4rem}
                 footer a{color:var(--purple-muted);text-decoration:none}
                 footer a:hover{color:var(--blue)}
@@ -1779,6 +2257,7 @@ public class WebService implements IWebService {
                     <div class="sidebar-section">
                       <h4>Settings</h4>
                       <a href="/settings">&#9881; Web Panel Settings</a>
+                      <a href="/prefixes">&#127991; Message Prefixes</a>
                     </div>
 
                     <div class="sidebar-section">
@@ -1797,29 +2276,64 @@ public class WebService implements IWebService {
                   <div class="main-area">
                     <div class="content">
 
-                      <div class="sh"><span>Plugin Modules</span><span id="mod-count"></span></div>
-                      <div id="modules" class="modules-grid"><p class="empty">Loading&hellip;</p></div>
-
-                      <div class="sh"><span>Server Info</span></div>
+                      <div class="sh"><span>Overview</span></div>
                       <div class="info-grid">
-                        <div class="info-card"><div class="label">Software</div><div id="version" class="val">—</div></div>
+                        <div class="info-card"><div class="label">Players Online</div><div id="players-online" class="val">—</div></div>
+                        <div class="info-card"><div class="label">TPS (1m)</div><div id="tps-short" class="val">—</div></div>
+                        <div class="info-card"><div class="label">Memory</div><div id="mem" class="val">—</div></div>
+                        <div class="info-card"><div class="label">CPU (process)</div><div id="cpu" class="val">—</div></div>
+                        <div class="info-card"><div class="label">Disk Free</div><div id="disk" class="val">—</div></div>
                         <div class="info-card"><div class="label">Uptime</div><div id="uptime2" class="val">—</div></div>
+                        <div class="info-card"><div class="label">Software</div><div id="version" class="val">—</div></div>
                         <div class="info-card"><div class="label">HTTP Port</div><div id="port" class="val">—</div></div>
                         <div class="info-card"><div class="label">Total Plugins</div><div id="pcount" class="val">—</div></div>
                         <div class="info-card"><div class="label">Web Modules</div><div id="mcount" class="val">—</div></div>
-                        <div class="info-card"><div class="label">TPS 5m / 15m</div><div id="tps-long" class="val">—</div></div>
                         <div class="info-card"><div class="label">Active Sessions</div><div id="sessions" class="val">—</div></div>
+                        <div class="info-card"><div class="label">Accounts</div><div class="val"><a href="/account" id="accounts-count">—</a></div></div>
+                        <div class="info-card"><div class="label">Prefix Overrides</div><div class="val"><a href="/prefixes" id="prefix-count">—</a></div></div>
                         <div class="info-card"><div class="label">MOTD</div><div id="motd" class="val">—</div></div>
                       </div>
 
-                      <div class="sh"><span>Worlds</span></div>
-                      <table class="data-table">
-                        <thead><tr><th>Name</th><th>Environment</th><th>Loaded Chunks</th></tr></thead>
-                        <tbody id="worlds"></tbody>
-                      </table>
+                      <div class="dashboard-grid">
+                        <div class="col-main">
+                          <div class="sh"><span>Plugin Modules</span><span id="mod-count"></span></div>
+                          <div id="modules" class="modules-grid"><p class="empty">Loading&hellip;</p></div>
 
-                      <div class="sh"><span>Loaded Plugins</span><span id="plugin-count-label"></span></div>
-                      <div id="plist" class="plugin-list"><span class="empty">Loading&hellip;</span></div>
+                          <div class="sh"><span>Worlds</span></div>
+                          <table class="data-table">
+                            <thead><tr><th>Name</th><th>Environment</th><th>Loaded Chunks</th></tr></thead>
+                            <tbody id="worlds"></tbody>
+                          </table>
+
+                          <div class="sh"><span>Loaded Plugins</span><span id="plugin-count-label"></span></div>
+                          <div id="plist" class="plugin-list"><span class="empty">Loading&hellip;</span></div>
+                        </div>
+
+                        <div class="col-side">
+                          <div class="side-card">
+                            <h3><span>Online Players</span><span id="online-count"></span></h3>
+                            <div id="online-players"><p class="empty">Loading&hellip;</p></div>
+                          </div>
+
+                          <div class="side-card">
+                            <h3>Quick Actions</h3>
+                            <div class="quick-actions">
+                              <a href="/account">&#128100; Manage Account</a>
+                              <a href="/prefixes">&#127991; Message Prefixes</a>
+                              <a href="/settings">&#9881; Web Panel Settings</a>
+                              <a href="/swagapi/">&#128196; API JSON</a>
+                              <a href="/api/status">&#128202; Status JSON</a>
+                            </div>
+                          </div>
+
+                          <div class="side-card">
+                            <h3>Access</h3>
+                            <div class="stat-mini"><span>Registered accounts</span><a class="v" href="/account" id="side-accounts">—</a></div>
+                            <div class="stat-mini"><span>Active sessions</span><span class="v" id="side-sessions">—</span></div>
+                            <div class="stat-mini"><span>Prefix overrides</span><a class="v" href="/prefixes" id="side-prefixes">—</a></div>
+                          </div>
+                        </div>
+                      </div>
                     </div>
                     <footer>
                       <span>SwagAPI Control Panel &mdash; <a href="/swagapi/">API JSON</a> &mdash; <a href="/api/status">Status JSON</a></span>
@@ -1845,16 +2359,26 @@ public class WebService implements IWebService {
                 </script>
                 <script>
                 function fmtUp(ms){var h=Math.floor(ms/3600000),m=Math.floor((ms%3600000)/60000),s=Math.floor((ms%60000)/1000);return h>0?h+'h '+m+'m':m>0?m+'m '+s+'s':s+'s'}
+                function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
                 // The shared topbar (topbar.js) owns the /api/status poll and the Players/TPS/Mem/Uptime
                 // chips; this page just listens for its broadcast to fill in everything else.
                 window.addEventListener('swag-status', function(e){
                   try{
                     var d=e.detail;
-                    var t5=parseFloat(d.tps['5m']),t15=parseFloat(d.tps['15m']);
-                    document.getElementById('tps-long').textContent=t5.toFixed(1)+' / '+t15.toFixed(1);
+                    var t1=parseFloat(d.tps['1m']);
+                    document.getElementById('tps-short').textContent=t1.toFixed(1);
+                    document.getElementById('mem').textContent=(d.memory.used/1024).toFixed(1)+' / '+(d.memory.max/1024).toFixed(1)+' GB';
+                    document.getElementById('cpu').textContent = d.cpu>=0 ? (d.cpu*100).toFixed(0)+'%' : 'n/a';
+                    document.getElementById('disk').textContent = d.disk.free+' / '+d.disk.total+' GB';
                     var up=fmtUp(d.uptime);
                     document.getElementById('uptime2').textContent=up;
                     document.getElementById('sessions').textContent=d.sessions;
+                    document.getElementById('side-sessions').textContent=d.sessions;
+                    document.getElementById('accounts-count').textContent=d.accounts;
+                    document.getElementById('side-accounts').textContent=d.accounts;
+                    document.getElementById('prefix-count').textContent=d.prefixOverrides;
+                    document.getElementById('side-prefixes').textContent=d.prefixOverrides;
+                    document.getElementById('players-online').textContent=d.players.online+' / '+d.players.max;
                     if(d.motd)document.getElementById('motd').textContent=d.motd.replace(/§./g,'');
                     document.getElementById('version').textContent=d.version;
                     document.getElementById('port').textContent=d.port;
@@ -1872,6 +2396,13 @@ public class WebService implements IWebService {
                     document.getElementById('plist').innerHTML=d.plugins.map(function(p){
                       return '<span class="'+(p.enabled?'plugin-ok':'plugin-off')+'" title="v'+p.version+'">● '+p.name+'</span>';
                     }).join('');
+                    document.getElementById('online-count').textContent=d.onlinePlayers.length+' online';
+                    var op=document.getElementById('online-players');
+                    op.innerHTML=d.onlinePlayers.length?d.onlinePlayers.map(function(p){
+                      return '<div class="player-row"><img class="player-avatar" src="https://mc-heads.net/avatar/'+p.uuid+'/26" alt="" loading="lazy">'
+                        +'<div class="player-info"><span class="player-name">'+esc(p.name)+'</span>'
+                        +'<span class="player-meta">'+esc(p.world)+' &middot; '+p.gamemode.toLowerCase()+'</span></div></div>';
+                    }).join(''):'<p class="empty">No players online.</p>';
                     document.getElementById('ts').textContent='Updated '+new Date().toLocaleTimeString();
                   }catch(e){document.getElementById('ts').textContent='Connection error';console.error(e);}
                 });
@@ -1889,6 +2420,50 @@ public class WebService implements IWebService {
 
     private static String escapeHtmlAttr(String s) {
         return s.replace("&", "&amp;").replace("\"", "&quot;").replace("<", "&lt;").replace(">", "&gt;");
+    }
+
+    private static final java.util.regex.Pattern LEGACY_HEX =
+            java.util.regex.Pattern.compile("(?i)[&§]#([0-9a-f]{6})");
+    private static final java.util.regex.Pattern LEGACY_CODE =
+            java.util.regex.Pattern.compile("(?i)[&§]([0-9a-fk-or])");
+    private static final Map<Character, String> LEGACY_TAGS = Map.ofEntries(
+            Map.entry('0', "<black>"), Map.entry('1', "<dark_blue>"), Map.entry('2', "<dark_green>"),
+            Map.entry('3', "<dark_aqua>"), Map.entry('4', "<dark_red>"), Map.entry('5', "<dark_purple>"),
+            Map.entry('6', "<gold>"), Map.entry('7', "<gray>"), Map.entry('8', "<dark_gray>"),
+            Map.entry('9', "<blue>"), Map.entry('a', "<green>"), Map.entry('b', "<aqua>"),
+            Map.entry('c', "<red>"), Map.entry('d', "<light_purple>"), Map.entry('e', "<yellow>"),
+            Map.entry('f', "<white>"), Map.entry('k', "<obfuscated>"), Map.entry('l', "<bold>"),
+            Map.entry('m', "<strikethrough>"), Map.entry('n', "<underlined>"), Map.entry('o', "<italic>"),
+            Map.entry('r', "<reset>"));
+
+    /**
+     * Lets a prefix override be typed as legacy {@code &}/{@code §} colour codes (including
+     * shorthand hex, {@code &#rrggbb}) as well as native MiniMessage tags — converts any legacy
+     * markers to their MiniMessage equivalent and leaves everything else (plain text, already-MiniMessage
+     * tags like {@code <gradient:...>}) completely untouched, so {@link IPrefixService}'s contract
+     * (always MiniMessage) holds regardless of which style an admin typed into the /prefixes form.
+     * Mirrors SwagCore's {@code ComponentUtil.legacyToMiniMessage} — duplicated rather than shared
+     * since SwagCore depends on SwagAPI, not the other way around.
+     */
+    private static String normalizeToMiniMessage(String text) {
+        if (text == null || text.isEmpty()) return text;
+
+        StringBuilder sb = new StringBuilder();
+        var hex = LEGACY_HEX.matcher(text);
+        while (hex.find()) {
+            hex.appendReplacement(sb, "<#" + hex.group(1) + ">");
+        }
+        hex.appendTail(sb);
+        text = sb.toString();
+
+        StringBuilder sb2 = new StringBuilder();
+        var code = LEGACY_CODE.matcher(text);
+        while (code.find()) {
+            String tag = LEGACY_TAGS.get(Character.toLowerCase(code.group(1).charAt(0)));
+            code.appendReplacement(sb2, tag != null ? java.util.regex.Matcher.quoteReplacement(tag) : "");
+        }
+        code.appendTail(sb2);
+        return sb2.toString();
     }
 
     // ─── Config patching ────────────────────────────────────────────────────
