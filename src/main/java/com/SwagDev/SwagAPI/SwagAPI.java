@@ -67,6 +67,8 @@ public final class SwagAPI extends JavaPlugin {
         SwagAPICommand swagApiCommand = new SwagAPICommand(this);
         getCommand("swagapi").setExecutor(swagApiCommand);
         getCommand("swagapi").setTabCompleter(swagApiCommand);
+        getCommand("webeditor").setExecutor(swagApiCommand);
+        getCommand("webeditor").setTabCompleter(swagApiCommand);
 
         getLogger().info("[SwagAPI] Ready in " + (System.currentTimeMillis() - start) + "ms.");
     }

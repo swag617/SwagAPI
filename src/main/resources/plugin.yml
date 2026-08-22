@@ -12,6 +12,10 @@ commands:
     usage: /swagapi <reload|status|info|updatecheck|update|updates|web>
     permission: swagapi.admin
     aliases: [sapi]
+  webeditor:
+    description: Jump straight to the web dashboard or any registered plugin's web editor
+    usage: /webeditor [setup|whoami|resetpassword]
+    permission: swagapi.admin
 
 permissions:
   swagapi.admin:

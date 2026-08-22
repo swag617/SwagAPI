@@ -38,6 +38,17 @@ public class SwagAPICommand implements CommandExecutor, TabCompleter {
             sender.sendMessage(ColorUtil.colorize("&cYou do not have permission to use this command."));
             return true;
         }
+
+        // /webeditor is a direct shortcut to /swagapi web — same handler, same subcommands
+        // (setup/whoami/resetpassword), just without needing "web" as the first word every time.
+        if (label.equalsIgnoreCase("webeditor")) {
+            String[] shifted = new String[args.length + 1];
+            shifted[0] = "web";
+            System.arraycopy(args, 0, shifted, 1, args.length);
+            handleWeb(sender, shifted);
+            return true;
+        }
+
         if (args.length == 0) {
             sendUsage(sender);
             return true;
@@ -64,6 +75,18 @@ public class SwagAPICommand implements CommandExecutor, TabCompleter {
     @Override
     public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
         if (!sender.hasPermission("swagapi.admin")) return List.of();
+
+        if (alias.equalsIgnoreCase("webeditor")) {
+            if (args.length == 1) return filterPrefix(WEB_SUBCOMMANDS, args[0]);
+            if (args.length == 2 && args[0].equalsIgnoreCase("whoami")) {
+                return filterPrefix(onlinePlayerNames(), args[1]);
+            }
+            if (args.length == 2 && args[0].equalsIgnoreCase("resetpassword")) {
+                WebService ws = plugin.getWebService();
+                return ws != null ? filterPrefix(ws.getAllAccountUsernames(), args[1]) : List.of();
+            }
+            return List.of();
+        }
 
         if (args.length == 1) {
             return filterPrefix(SUBCOMMANDS, args[0]);
