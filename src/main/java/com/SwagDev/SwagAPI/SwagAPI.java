@@ -21,6 +21,7 @@ public final class SwagAPI extends JavaPlugin {
     private UpdateService updateService;
     private WebService webService;
     private PrefixService prefixService;
+    private OverflowService overflowService;
 
     @Override
     public void onEnable() {
@@ -48,6 +49,8 @@ public final class SwagAPI extends JavaPlugin {
         prefixService = new PrefixService(this);
         prefixService.initialize();
 
+        overflowService = new OverflowService(this, databaseService);
+
         webService = new WebService(this);
         webService.initialize();
 
@@ -60,6 +63,7 @@ public final class SwagAPI extends JavaPlugin {
         sm.register(IUpdateService.class,     updateService,     this, ServicePriority.Normal);
         sm.register(IWebService.class,        webService,        this, ServicePriority.Normal);
         sm.register(IPrefixService.class,     prefixService,     this, ServicePriority.Normal);
+        sm.register(IOverflowService.class,   overflowService,   this, ServicePriority.Normal);
 
         getServer().getPluginManager().registerEvents(new PlayerSessionListener(this), this);
         getServer().getPluginManager().registerEvents(new AdminJoinUpdateListener(this), this);
@@ -95,4 +99,5 @@ public final class SwagAPI extends JavaPlugin {
     public UpdateService getUpdateService()           { return updateService; }
     public WebService getWebService()                 { return webService; }
     public PrefixService getPrefixService()            { return prefixService; }
+    public OverflowService getOverflowService()        { return overflowService; }
 }

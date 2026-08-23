@@ -47,6 +47,22 @@ public class DatabaseService implements IDatabaseService {
                 "  PRIMARY KEY (uuid, plugin_key)" +
                 ")"
             );
+            // Backs OverflowService (IOverflowService) — the ecosystem-wide overflow inbox.
+            // A per-entry random-UUID id (rather than an auto-increment column) sidesteps the
+            // MySQL/SQLite AUTO_INCREMENT syntax difference entirely, matching the id style
+            // already used for swagapi_players' primary key.
+            stmt.executeUpdate(
+                "CREATE TABLE IF NOT EXISTS swagapi_overflow_items (" +
+                "  id VARCHAR(36) NOT NULL PRIMARY KEY," +
+                "  uuid VARCHAR(36) NOT NULL," +
+                "  source_plugin VARCHAR(64) NOT NULL," +
+                "  item_data TEXT NOT NULL," +
+                "  stored_at BIGINT NOT NULL" +
+                ")"
+            );
+            stmt.executeUpdate(
+                "CREATE INDEX IF NOT EXISTS idx_swagapi_overflow_uuid ON swagapi_overflow_items(uuid)"
+            );
         } catch (SQLException e) {
             plugin.getLogger().severe("Failed to create database tables: " + e.getMessage());
         }
