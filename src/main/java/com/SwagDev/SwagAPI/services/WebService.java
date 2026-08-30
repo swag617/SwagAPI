@@ -321,6 +321,40 @@ public class WebService implements IWebService {
 
     // ─── IWebService ─────────────────────────────────────────────────────────
 
+    /**
+     * Hard exception boundary around any third-party plugin's module/service handler running on
+     * this shared server. Catches {@link Throwable} (not just {@code Exception}) since a
+     * downstream handler throwing an {@code Error} — e.g. a stack overflow from runaway
+     * recursion, or a linkage error from a stale/mismatched jar — is just as capable of leaving
+     * the exchange dangling as a checked exception, and this is the LAST line of defense before
+     * the JDK's own HttpServer internals. On any throw: logs it (with the offending plugin's
+     * name, since with a dozen+ modules sharing one server, "some handler threw" alone isn't
+     * actionable) and attempts a plain-text 500 response — best-effort only, since the failure
+     * could itself be "the exchange's output stream is already broken." Always closes the
+     * exchange in the {@code finally}, whether or not the handler itself already closed it —
+     * {@link HttpExchange#close()} is documented safe to call multiple times.
+     */
+    private void safelyHandle(HttpExchange exchange, String moduleName, HttpHandler handler) {
+        try {
+            handler.handle(exchange);
+        } catch (Throwable t) {
+            plugin.getLogger().log(java.util.logging.Level.WARNING,
+                    "[SwagAPI] Web module '" + moduleName + "' threw handling "
+                            + exchange.getRequestURI() + " — request failed, server stays up", t);
+            try {
+                byte[] body = "Internal error — this module's handler threw an exception. Check the server console.".getBytes();
+                exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
+                exchange.sendResponseHeaders(500, body.length);
+                exchange.getResponseBody().write(body);
+            } catch (Throwable ignored) {
+                // Best-effort — the exchange may already be in a broken state that a response
+                // write can't recover from; the finally block's close() is what actually matters.
+            }
+        } finally {
+            try { exchange.close(); } catch (Throwable ignored) {}
+        }
+    }
+
     @Override
     public void registerModule(Plugin plugin, HttpHandler handler) {
         if (!running || server == null) return;
@@ -332,10 +366,16 @@ public class WebService implements IWebService {
         try { server.removeContext(path);    } catch (IllegalArgumentException ignored) {}
         try { server.removeContext(noSlash); } catch (IllegalArgumentException ignored) {}
 
-        // Wrap with auth + prefix stripping
+        // Wrap with auth + prefix stripping + a hard exception boundary (see
+        // safelyHandle's javadoc — every module handler on this shared server used to run with
+        // NO protection at all: an uncaught exception from any ONE plugin's dashboard handler
+        // propagated straight up into the JDK HttpServer's own exchange machinery, with no
+        // guarantee the exchange/socket ever got closed. Real report: "web panel keeps going
+        // down" — with a dozen+ plugins' handlers all riding this one shared server, a bug in
+        // any single one was a single point of failure for every OTHER plugin's dashboard too.
         server.createContext(path, exchange -> {
             if (!verifySession(exchange)) return;
-            new PrefixStrippingHandler(path, handler).handle(exchange);
+            safelyHandle(exchange, name, new PrefixStrippingHandler(path, handler));
         });
         registeredModules.addIfAbsent(name);
 
@@ -361,7 +401,7 @@ public class WebService implements IWebService {
 
         server.createContext(path, exchange -> {
             if (!verifyServiceKey(exchange)) return;
-            new PrefixStrippingHandler(path, handler).handle(exchange);
+            safelyHandle(exchange, name, new PrefixStrippingHandler(path, handler));
         });
 
         server.createContext(noSlash, exchange -> {
@@ -413,6 +453,7 @@ public class WebService implements IWebService {
             exchange.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
             exchange.sendResponseHeaders(503, body.length);
             try (OutputStream out = exchange.getResponseBody()) { out.write(body); }
+            exchange.close();
             return false;
         }
 
@@ -426,6 +467,7 @@ public class WebService implements IWebService {
         exchange.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
         exchange.sendResponseHeaders(401, body.length);
         try (OutputStream out = exchange.getResponseBody()) { out.write(body); }
+        exchange.close();
         return false;
     }
 
@@ -708,6 +750,7 @@ public class WebService implements IWebService {
             exchange.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
             exchange.sendResponseHeaders(401, body.length);
             try (OutputStream out = exchange.getResponseBody()) { out.write(body); }
+            exchange.close();
         } else {
             URI uri = exchange.getRequestURI();
             String target = uri.getRawQuery() != null ? uri.getRawPath() + "?" + uri.getRawQuery() : uri.getRawPath();

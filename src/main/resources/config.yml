@@ -66,8 +66,16 @@ web-server:
   # reachable hostname or public IP (and make sure the port above is forwarded/open) so
   # non-LAN admins get a link that actually works for them.
   public-address: ""
-  # Number of threads in the HTTP handler pool. Increase under heavy API load.
-  threads: 8
+  # Number of threads in the HTTP handler pool. Increase under heavy API load. Raised from the
+  # original default of 8 — this pool is now shared across a dozen+ plugins' dashboard modules
+  # (each registers its own via registerModule), several of which block their handling thread
+  # while waiting on an async DB query to finish (up to a few seconds each) rather than
+  # responding asynchronously. With only 8 threads total for the whole shared server, a handful
+  # of concurrent slow requests across DIFFERENT plugins' dashboards could exhaust the pool and
+  # make every OTHER module's dashboard appear to hang/"go down" too, even though nothing
+  # actually crashed. 24 gives real headroom without material added memory cost for what's
+  # still a lightweight embedded HTTP server.
+  threads: 24
   auth:
     # Set to false to disable login (not recommended on publicly exposed ports).
     enabled: true
