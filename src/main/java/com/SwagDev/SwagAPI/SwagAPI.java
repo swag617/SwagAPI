@@ -22,6 +22,8 @@ public final class SwagAPI extends JavaPlugin {
     private WebService webService;
     private PrefixService prefixService;
     private OverflowService overflowService;
+    private PartyService partyService;
+    private ConfigMigrationService configMigrationService;
 
     @Override
     public void onEnable() {
@@ -51,6 +53,10 @@ public final class SwagAPI extends JavaPlugin {
 
         overflowService = new OverflowService(this, databaseService);
 
+        partyService = new PartyService();
+
+        configMigrationService = new ConfigMigrationService(this);
+
         webService = new WebService(this);
         webService.initialize();
 
@@ -64,6 +70,8 @@ public final class SwagAPI extends JavaPlugin {
         sm.register(IWebService.class,        webService,        this, ServicePriority.Normal);
         sm.register(IPrefixService.class,     prefixService,     this, ServicePriority.Normal);
         sm.register(IOverflowService.class,   overflowService,   this, ServicePriority.Normal);
+        sm.register(IPartyService.class,      partyService,      this, ServicePriority.Normal);
+        sm.register(IConfigMigrationService.class, configMigrationService, this, ServicePriority.Normal);
 
         getServer().getPluginManager().registerEvents(new PlayerSessionListener(this), this);
         getServer().getPluginManager().registerEvents(new AdminJoinUpdateListener(this), this);
@@ -82,6 +90,7 @@ public final class SwagAPI extends JavaPlugin {
         getLogger().info("[SwagAPI] Shutting down...");
         if (webService        != null) webService.shutdown();
         if (updateService     != null) updateService.shutdown();
+        if (partyService      != null) partyService.shutdown();
         if (playerDataService != null) playerDataService.saveAll();
         if (databaseService   != null) databaseService.shutdown();
         getServer().getServicesManager().unregisterAll(this);
@@ -100,4 +109,6 @@ public final class SwagAPI extends JavaPlugin {
     public WebService getWebService()                 { return webService; }
     public PrefixService getPrefixService()            { return prefixService; }
     public OverflowService getOverflowService()        { return overflowService; }
+    public PartyService getPartyService()              { return partyService; }
+    public ConfigMigrationService getConfigMigrationService() { return configMigrationService; }
 }
